@@ -13,6 +13,7 @@
 
 
 from glob import glob
+from collections import OrderedDict
 from sklearn.model_selection import GroupKFold
 import cv2
 import argparse
@@ -25,7 +26,6 @@ import time
 import random
 import pandas as pd
 import numpy as np
-import torch.nn.functional as F
 import albumentations as A
 import matplotlib.pyplot as plt
 from albumentations.pytorch.transforms import ToTensorV2
@@ -56,17 +56,13 @@ SEED = 42
 seed_everything(SEED)
 DATA_ROOT_PATH = os.getenv('data_path', '/media/vlad/hdd4_tb/datasets/alaska2')
 base_dir = os.getenv("model_save_dir", './')
-MODEL_NAME = os.getenv('model_path', 'efficientnet-b3')
-MODEL_ARCHITECTURE = os.getenv('model_architecture', 'efficientnet-b3')
+MODEL_NAME = os.getenv('model_path', 'efficientnet-b7')
+MODEL_ARCHITECTURE = os.getenv('model_architecture', 'efficientnet-b7')
 NORMALIZATION = os.getenv('norm', 'wo_imagenet')
-
 CUSTOM_CHECKPOINT = os.getenv('custom_checkpoint', 'True')
 CUSTOM_CHECKPOINT = True if CUSTOM_CHECKPOINT == 'True' else False
-
-ONLY_SUBMIT = os.getenv('only_submit', 'False')
+ONLY_SUBMIT = os.getenv('only_submit', 'True')
 ONLY_SUBMIT = True if ONLY_SUBMIT == 'True' else False
-
-
 
 TRAIN_ON_VALID = os.getenv('train_on_valid', 'False')
 TRAIN_ON_VALID = True if TRAIN_ON_VALID == 'True' else False
@@ -75,7 +71,10 @@ if 'model_path' in os.environ:
     MODEL_NAME = os.path.join(os.environ['model_path'], os.environ['checkpoint_name'])
     
 # model_path = os.path.join(os.environ['model_path'], 'efficientnet-b7-dcc49843.pth')
-IN_FEATURES = int(os.getenv('in_features', 1536))
+# b3 1536
+# b2 1408
+# b7 2560
+IN_FEATURES = int(os.getenv('in_features', 2560))
 
 WRITER = SummaryWriter(flush_secs=15, log_dir=os.path.join(base_dir, 'tb_logs'))
 
@@ -85,8 +84,6 @@ class TrainGlobalConfig:
     n_epochs = int(os.getenv('epochs', 35))
     lr = float(os.getenv('lr', 0.001))
     grad_accum_steps = int(os.getenv('grad_accum_steps', 0))
-    FOCAL_LOSS = os.getenv('focal_loss', 'False')
-    FOCAL_LOSS = True if FOCAL_LOSS == 'True' else False
     
     # -------------------
     verbose = True
@@ -323,30 +320,6 @@ class LabelSmoothing(nn.Module):
         else:
             return torch.nn.functional.cross_entropy(x, target)
 
-        
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=1, gamma=2, logits=True, reduce=True):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.logits = logits
-        self.reduce = reduce
-
-    def forward(self, inputs, targets):
-        inputs = inputs.float()
-        targets = targets.float()
-        
-        if self.logits:
-            BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduce=False)
-        else:
-            BCE_loss = F.binary_cross_entropy(inputs, targets, reduce=False)
-        pt = torch.exp(-BCE_loss)
-        F_loss = self.alpha * (1-pt)**self.gamma * BCE_loss
-
-        if self.reduce:
-            return torch.mean(F_loss)
-        else:
-            return F_loss  
 
 class Fitter:
     
@@ -372,11 +345,7 @@ class Fitter:
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.lr)
         self.scheduler = config.SchedulerClass(self.optimizer, **config.scheduler_params)
-        
-        if self.config.FOCAL_LOSS:
-            self.criterion = FocalLoss().to(self.device)
-        else:
-            self.criterion = LabelSmoothing().to(self.device)
+        self.criterion = LabelSmoothing().to(self.device)
         self.log(f'Fitter prepared. Device is {self.device}')
 
     def fit(self, train_loader, validation_loader):
@@ -534,6 +503,7 @@ def get_net(model_name, in_features, model_architecture):
     else:
         net = EfficientNet.from_pretrained(model_architecture)
     net._fc = nn.Linear(in_features=in_features, out_features=4, bias=True)
+    net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
     return net
 
 
@@ -587,10 +557,12 @@ def main(rank=-1, world_size=-1):
     
     net = get_net(MODEL_NAME, IN_FEATURES, MODEL_ARCHITECTURE).to(device)
     
+    
     fitter = Fitter(model=net, device=device, config=TrainGlobalConfig, base_dir=base_dir, rank=rank)
     
     if os.path.exists(os.path.dirname(MODEL_NAME)) and CUSTOM_CHECKPOINT:
         fitter.load(MODEL_NAME)
+    
     
     sampler = BalanceClassSampler(labels=train_dataset.get_labels(), mode="downsampling")
     
@@ -616,6 +588,7 @@ def main(rank=-1, world_size=-1):
     )
     
     if not ONLY_SUBMIT:
+        fitter.model = DDP(fitter.model, device_ids=[rank], output_device=rank)
         fitter.fit(train_loader, val_loader)
     
         file = open(f'{base_dir}/log.txt', 'r')
@@ -624,9 +597,16 @@ def main(rank=-1, world_size=-1):
         file.close()
 
     if rank in [0, -1]:
+        net = get_net(MODEL_NAME, IN_FEATURES, MODEL_ARCHITECTURE).to(device)
         print_once('Run inference')
         checkpoint = torch.load(os.path.join(base_dir, 'BEST_MODEL.bin'))
-        net.load_state_dict(checkpoint['model_state_dict'])
+
+        new_state_dict = OrderedDict()
+        for k, v in checkpoint['model_state_dict'].items():
+            name = k[7:] # remove `module.`
+            new_state_dict[name] = v
+            
+        net.load_state_dict(new_state_dict)
         net.to(device)
         
         if TRAIN_ON_VALID:
@@ -654,7 +634,7 @@ def main(rank=-1, world_size=-1):
 
         data_loader = DataLoader(
             dataset,
-            batch_size=8,
+            batch_size=2,
             shuffle=False,
             num_workers=2,
             drop_last=False,
@@ -672,7 +652,7 @@ def main(rank=-1, world_size=-1):
 
 
         submission = pd.DataFrame(result)
-        submission.to_csv('submission.csv', index=False)
+        submission.to_csv('b2-focall-loss-continue.csv', index=False)
 
     
 if __name__ == "__main__":
