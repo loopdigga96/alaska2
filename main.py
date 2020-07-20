@@ -1,17 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# # Main Ideas
-# 
-# - 4 Classes
-# - GroupKFold splitting
-# - Class Balance
-# - Flips
-# - Label Smoothing
-# - EfficientNetB2
-# - ReduceLROnPlateau
-
-
 from glob import glob
 from collections import OrderedDict
 from sklearn.model_selection import GroupKFold
