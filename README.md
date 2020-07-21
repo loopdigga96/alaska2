@@ -12,5 +12,4 @@ https://www.kaggle.com/c/alaska2-image-steganalysis/overview
 - augmentations with flips (horizntal, vertical)
 
 # results:
-- public LB:
-- private LB:
+- private LB: 107/1115 place top 10%, bronze medal
